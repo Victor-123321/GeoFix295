@@ -4,7 +4,7 @@
 
 import pandas as pd
 import geopandas as gpd
-from shapely.geometry import Point
+from shapely.geometry import Point, LineString, Polygon
 import os
 import logging
 import argparse
@@ -88,6 +88,44 @@ def compute_poi_geometry(poi_df, streets_nav):
     poi_gdf['geometry'] = geometries
     return gpd.GeoDataFrame(poi_gdf, crs="EPSG:4326")
 
+def find_multidigit_pairs(streets_nav, streets_naming):
+    """Identify pairs of MULTIDIGIT links with same ST_NAME."""
+    multidigit_links = streets_nav
+    pairs = []
+    max_links = 1000 #Temporary limit for testing
+    for idx1, link1 in multidigit_links.head(max_links).iterrows():
+        link_id1 = link1["link_id"]
+        geom1 = link1.geometry
+        #Find matching street name
+        naming1 = streets_naming[streets_naming['link_id']] == link_id1
+        if naming1.empty:
+            continue
+        st_name1 = naming1.iloc[0]['ST_NAME']
+        
+        #Finding a potential pair
+        for idx2,link2 in multidigit_links.iloc[idx1+1].head(max_links).iterrows():
+            naming2 = streets_naming[streets_naming['link_id'] == link2['link_id']]
+            if naming2.empty:
+                continue
+            st_name2 = naming2.iloc[0]['ST_NAME']
+            
+            #Check if same street and close proximity
+            if st_name1 == st_name2 and geom1.distance(link2.geometry) < 50 / 111000: #Around 50m
+                pairs.append((link_id1,link2['link_id'],geom1, link2.geometry))
+    return pairs
+
+def check_inside_multidigit(poi_point, link1_geom, link2_geom):
+    """Check if POI lies between two MULTIDIGIT links (inside)."""
+    if not (poi_point and link1_geom.is_valid and link2_geom.is_valid):
+        return False
+    try:
+        # Combine coordinates of both links to form a polygon
+        coords = list(link1_geom.coords) + list(link2_geom.coords)[::-1]  # Reverse second link for closed polygon
+        polygon = Polygon(coords)
+        return polygon.contains(poi_point)
+    except:
+        return False
+
 def main():
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='Process POI295 validations')
@@ -113,6 +151,7 @@ def main():
     logging.info(f"Processed {len(poi_gdf)} POIs with geometries")
     
     # Save temporary output for debugging
+    
     poi_gdf.drop(columns=['geometry']).to_csv('temp_pois.csv', index=False)
     print("Saved temporary output to temp_pois.csv")
 
