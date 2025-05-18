@@ -4,7 +4,7 @@
 
 import pandas as pd
 import geopandas as gpd
-from shapely.geometry import Point
+from shapely.geometry import Point, LineString, Polygon
 import os
 import logging
 import argparse
@@ -113,6 +113,19 @@ def find_multidigit_pairs(streets_nav, streets_naming):
             if st_name1 == st_name2 and geom1.distance(link2.geometry) < 50 / 111000: #Around 50m
                 pairs.append((link_id1,link2['link_id'],geom1, link2.geometry))
     return pairs
+
+def check_inside_multidigit(poi_point, link1_geom, link2_geom):
+    """Check if POI lies between two MULTIDIGIT links (inside)."""
+    if not (poi_point and link1_geom.is_valid and link2_geom.is_valid):
+        return False
+    try:
+        # Combine coordinates of both links to form a polygon
+        coords = list(link1_geom.coords) + list(link2_geom.coords)[::-1]  # Reverse second link for closed polygon
+        polygon = Polygon(coords)
+        return polygon.contains(poi_point)
+    except:
+        return False
+
 def main():
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='Process POI295 validations')
