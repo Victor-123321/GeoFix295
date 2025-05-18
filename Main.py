@@ -1,17 +1,30 @@
-# GeoFix295: POI295 Validation Correction Tool
-# Early development for HERE Technologies GuadalaHacks 2025
-# Implements data loading and POI geometry computation
-
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point, LineString, Polygon
 import os
+import uuid
 import logging
 import argparse
+import re
 
 # Set up logging
 logging.basicConfig(filename='poi295_corrections.log', level=logging.INFO,
                     format='%(asctime)s - %(message)s')
+
+# Mock function for satellite imagery analysis (placeholder)
+def check_poi_existence(coordinates, poi_name):
+    """Mock function to check POI existence via satellite imagery."""
+    # TODO: Implement HERE Raster Tile API call with API key
+    # For now, return True (assume POI exists) for testing
+    logging.info(f"Mock imagery check for {poi_name} at {coordinates}: Assumed to exist")
+    return True
+
+def check_vegetation(link_id, coordinates):
+    """Mock function to check vegetation for MULTIDIGIT validation."""
+    # TODO: Implement imagery analysis for vegetation detection
+    # For now, return False (assume no heavy vegetation)
+    logging.info(f"Mock vegetation check for link {link_id} at {coordinates}: No vegetation")
+    return False
 
 def load_datasets(poi_folder, streets_nav_folder, streets_naming_folder, mode='test'):
     """Load and merge POI, Streets Nav, and Naming datasets based on mode."""
@@ -90,28 +103,30 @@ def compute_poi_geometry(poi_df, streets_nav):
 
 def find_multidigit_pairs(streets_nav, streets_naming):
     """Identify pairs of MULTIDIGIT links with same ST_NAME."""
-    multidigit_links = streets_nav
+    multidigit_links = streets_nav[streets_nav['MULTIDIGIT'] == 'Y']
     pairs = []
-    max_links = 1000 #Temporary limit for testing
+    max_links = 1000  # Temporary limit for testing
     for idx1, link1 in multidigit_links.head(max_links).iterrows():
-        link_id1 = link1["link_id"]
+        link_id1 = link1['link_id']
         geom1 = link1.geometry
-        #Find matching street name
-        naming1 = streets_naming[streets_naming['link_id']] == link_id1
+        # Find matching street name
+        naming1 = streets_naming[streets_naming['link_id'] == link_id1]
         if naming1.empty:
             continue
         st_name1 = naming1.iloc[0]['ST_NAME']
         
-        #Finding a potential pair
-        for idx2,link2 in multidigit_links.iloc[idx1+1].head(max_links).iterrows():
+        # Find potential pair
+        for idx2, link2 in multidigit_links.iloc[idx1+1:].head(max_links).iterrows():
             naming2 = streets_naming[streets_naming['link_id'] == link2['link_id']]
             if naming2.empty:
                 continue
             st_name2 = naming2.iloc[0]['ST_NAME']
             
-            #Check if same street and close proximity
-            if st_name1 == st_name2 and geom1.distance(link2.geometry) < 50 / 111000: #Around 50m
-                pairs.append((link_id1,link2['link_id'],geom1, link2.geometry))
+            # Check if same street and close proximity
+            if st_name1 == st_name2 and geom1.distance(link2.geometry) < 50 / 111000:  # ~50m
+                pairs.append((link_id1, link2['link_id'], geom1, link2.geometry))
+    
+    logging.info(f"Found {len(pairs)} MULTIDIGIT pairs")
     return pairs
 
 def check_inside_multidigit(poi_point, link1_geom, link2_geom):
@@ -126,6 +141,83 @@ def check_inside_multidigit(poi_point, link1_geom, link2_geom):
     except:
         return False
 
+def classify_scenario(poi, poi_point, link1, link2, streets_nav, streets_naming):
+    """Classify POI295 violation into one of four scenarios."""
+    poi_id = poi['POI_ID']
+    poi_name = poi['POI_NAME']
+    link_id = poi['LINK_ID']
+    poi_st_sd = poi['POI_ST_SD']
+    
+    # Scenario 1: No POI in reality
+    if not check_poi_existence(poi_point, poi_name):
+        return 1, "Mark for deletion"
+    
+    # Scenario 2: Incorrect POI location
+    # Check if POI is on correct side by analyzing nearby links
+    nearby_links = streets_nav[streets_nav.geometry.distance(poi_point) < 10 / 111000]  # ~10m
+    correct_link = None
+    for _, nearby in nearby_links.iterrows():
+        if nearby['link_id'] != link_id and nearby.geometry.distance(poi_point) < 5 / 111000:
+            correct_link = nearby
+            break
+    if correct_link is not None:
+        return 2, f"Update LINK_ID to {correct_link['link_id']}"
+    
+    # Scenario 3: Incorrect MULTIDIGIT attribution
+    naming1 = streets_naming[streets_naming['link_id'] == link1['link_id']]
+    naming2 = streets_naming[streets_naming['link_id'] == link2['link_id']]
+    if naming1.empty or naming2.empty:
+        logging.warning(f"Missing naming data for link1 {link1['link_id']} or link2 {link2['link_id']}")
+        return 3, "Set MULTIDIGIT = 'N' for both links"  # Fallback if no naming data
+    same_name = naming1.iloc[0]['ST_NAME'] == naming2.iloc[0]['ST_NAME']
+    no_vegetation = not check_vegetation(link_id, poi_point)
+    distance_ok = link1.geometry.distance(link2.geometry) < 30 / 111000  # ~30m threshold
+    if not (same_name and no_vegetation and distance_ok):
+        return 3, "Set MULTIDIGIT = 'N' for both links"
+    
+    # Scenario 4: Legitimate Exception
+    return 4, "Mark as Legitimate Exception"
+
+def apply_corrections(poi_gdf, streets_nav, violations):
+    """Apply corrections based on scenario classification."""
+    validations = []
+    for _, violation in violations.iterrows():
+        poi_id = violation['POI_ID']
+        scenario = violation['scenario']
+        action = violation['action']
+        poi_idx = poi_gdf[poi_gdf['POI_ID'] == poi_id].index[0]
+        link_id = poi_gdf.loc[poi_idx, 'LINK_ID']
+        
+        if scenario == 1:
+            # Delete POI
+            poi_gdf = poi_gdf.drop(poi_idx)
+            validations.append({'POI_ID': poi_id, 'Action': 'Deleted'})
+        elif scenario == 2:
+            # Update LINK_ID
+            match = re.search(r'Update LINK_ID to (\d+)', action)
+            if match:
+                new_link_id = match.group(1)
+                poi_gdf.loc[poi_idx, 'LINK_ID'] = int(new_link_id)
+            else:
+                logging.warning(f"Could not parse LINK_ID from action: {action}")
+                validations.append({'POI_ID': poi_id, 'Action': 'Skipped: Invalid LINK_ID'})
+                continue
+            validations.append({'POI_ID': poi_id, 'Action': action})
+        elif scenario == 3:
+            # Update MULTIDIGIT
+            link1_idx = streets_nav[streets_nav['link_id'] == violation['link_id1']].index[0]
+            link2_idx = streets_nav[streets_nav['link_id'] == violation['link_id2']].index[0]
+            streets_nav.loc[link1_idx, 'MULTIDIGIT'] = 'N'
+            streets_nav.loc[link2_idx, 'MULTIDIGIT'] = 'N'
+            validations.append({'POI_ID': poi_id, 'Action': action})
+        elif scenario == 4:
+            # Mark as exception
+            validations.append({'POI_ID': poi_id, 'Action': 'Legitimate Exception'})
+        
+        logging.info(f"POI {poi_id}: Scenario {scenario} - {action}")
+    
+    return poi_gdf, streets_nav, pd.DataFrame(validations)
+
 def main():
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='Process POI295 validations')
@@ -133,7 +225,7 @@ def main():
                         help='Mode: test (1 file per dataset) or full (all files)')
     args = parser.parse_args()
     
-    # File paths
+    # File paths (update as needed)
     poi_folder = 'POIs'
     streets_nav_folder = 'STREETS_NAV'
     streets_naming_folder = 'STREETS_NAMING_ADDRESSING'
@@ -146,14 +238,47 @@ def main():
     print(f"Computing POI geometries for {len(poi_df)} POIs...")
     poi_gdf = compute_poi_geometry(poi_df, streets_nav)
     
-    # Placeholder for future violation detection and correction
-    print("Geometry computation complete. Violation detection and corrections coming soon!")
-    logging.info(f"Processed {len(poi_gdf)} POIs with geometries")
+    # Find MULTIDIGIT pairs
+    print("Finding MULTIDIGIT pairs...")
+    multidigit_pairs = find_multidigit_pairs(streets_nav, streets_naming)
     
-    # Save temporary output for debugging
+    # Detect POI295 violations
+    print(f"Detecting violations among {len(multidigit_pairs)} MULTIDIGIT pairs...")
+    violations = []
+    for i, (link_id1, link_id2, geom1, geom2) in enumerate(multidigit_pairs):
+        pois = poi_gdf[poi_gdf['LINK_ID'].isin([link_id1, link_id2])]
+        for _, poi in pois.iterrows():
+            poi_point = poi.geometry
+            if poi_point and check_inside_multidigit(poi_point, geom1, geom2):
+                scenario, action = classify_scenario(
+                    poi,
+                    poi_point,
+                    streets_nav[streets_nav['link_id'] == link_id1].iloc[0],
+                    streets_nav[streets_nav['link_id'] == link_id2].iloc[0],
+                    streets_nav,
+                    streets_naming
+                )
+                violations.append({
+                    'POI_ID': poi['POI_ID'],
+                    'link_id1': link_id1,
+                    'link_id2': link_id2,
+                    'scenario': scenario,
+                    'action': action
+                })
+        if i % 10 == 0:
+            print(f"Processed {i+1}/{len(multidigit_pairs)} MULTIDIGIT pairs")
     
-    poi_gdf.drop(columns=['geometry']).to_csv('temp_pois.csv', index=False)
-    print("Saved temporary output to temp_pois.csv")
+    # Apply corrections
+    print("Applying corrections...")
+    updated_poi_gdf, updated_streets_nav, validations_df = apply_corrections(poi_gdf, streets_nav, pd.DataFrame(violations))
+    
+    # Save outputs
+    print("Saving outputs...")
+    updated_poi_gdf.drop(columns=['geometry']).to_csv('updated_pois.csv', index=False)
+    updated_streets_nav.to_file('updated_streets_nav.geojson', driver='GeoJSON')
+    validations_df.to_csv('validations.csv', index=False)
+    
+    print(f"Processed {len(violations)} POI295 violations. Check updated_pois.csv, updated_streets_nav.geojson, and validations.csv")
 
 if __name__ == '__main__':
     main()
