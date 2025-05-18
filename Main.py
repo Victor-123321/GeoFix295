@@ -112,6 +112,8 @@ def find_multidigit_pairs(streets_nav, streets_naming):
             #Check if same street and close proximity
             if st_name1 == st_name2 and geom1.distance(link2.geometry) < 50 / 111000: #Around 50m
                 pairs.append((link_id1,link2['link_id'],geom1, link2.geometry))
+
+    logging.info(f"Found {len(pairs)} MULTIDIGIT pairs")
     return pairs
 
 def check_inside_multidigit(poi_point, link1_geom, link2_geom):
@@ -146,14 +148,55 @@ def main():
     print(f"Computing POI geometries for {len(poi_df)} POIs...")
     poi_gdf = compute_poi_geometry(poi_df, streets_nav)
     
+    #Find MILTIDIGIT pairs
+    print("Finding MULTIDIGIT pairs...")
+    multidigit_pairs = find_multidigit_pairs(streets_nav, streets_naming)
+
     # Placeholder for future violation detection and correction
     print("Geometry computation complete. Violation detection and corrections coming soon!")
     logging.info(f"Processed {len(poi_gdf)} POIs with geometries")
     
-    # Save temporary output for debugging
+    # Detect POI295 violations
+    print(f"Detecting violations among {len(multidigit_pairs)} MULTIDIGIT pairs...")
+    violations = []
+    for i, (link_id1, link_id2, geom1, geom2) in enumerate(multidigit_pairs):
+        pois = poi_gdf[poi_gdf['LINK_ID'].isin([link_id1, link_id2])]
+        for _, poi in pois.iterrows():
+            poi_point = poi.geometry
+            if poi_point and check_inside_multidigit(poi_point, geom1, geom2):
+                scenario, action = classify_scenario(
+                    poi,
+                    poi_point,
+                    streets_nav[streets_nav['link_id'] == link_id1].iloc[0],
+                    streets_nav[streets_nav['link_id'] == link_id2].iloc[0],
+                    streets_nav,
+                    streets_naming
+                )
+                violations.append({
+                    'POI_ID': poi['POI_ID'],
+                    'link_id1': link_id1,
+                    'link_id2': link_id2,
+                    'scenario': scenario,
+                    'action': action
+                })
+        if i % 10 == 0:
+            print(f"Processed {i+1}/{len(multidigit_pairs)} MULTIDIGIT pairs")
     
+    # Save temporary output for debugging
     poi_gdf.drop(columns=['geometry']).to_csv('temp_pois.csv', index=False)
     print("Saved temporary output to temp_pois.csv")
+
+    # Apply corrections
+    print("Applying corrections...")
+    updated_poi_gdf, updated_streets_nav, validations_df = apply_corrections(poi_gdf, streets_nav, pd.DataFrame(violations))
+    
+    # Save outputs
+    print("Saving outputs...")
+    updated_poi_gdf.drop(columns=['geometry']).to_csv('updated_pois.csv', index=False)
+    updated_streets_nav.to_file('updated_streets_nav.geojson', driver='GeoJSON')
+    validations_df.to_csv('validations.csv', index=False)
+    
+    print(f"Processed {len(violations)} POI295 violations. Check updated_pois.csv, updated_streets_nav.geojson, and validations.csv")
 
 if __name__ == '__main__':
     main()
