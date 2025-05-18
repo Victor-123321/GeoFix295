@@ -4,7 +4,7 @@
 
 import pandas as pd
 import geopandas as gpd
-from shapely.geometry import Point
+from shapely.geometry import Point, LineString, Polygon
 import os
 import logging
 import argparse
@@ -88,43 +88,43 @@ def compute_poi_geometry(poi_df, streets_nav):
     poi_gdf['geometry'] = geometries
     return gpd.GeoDataFrame(poi_gdf, crs="EPSG:4326")
 
-def classify_scenario(poi, poi_point, link1, link2, streets_nav, streets_naming):
-    """Classify POI295 violation into one of four scenarios."""
-    poi_id = poi['POI_ID']
-    poi_name = poi['POI_NAME']
-    link_id = poi['LINK_ID']
-    poi_st_sd = poi['POI_ST_SD']
-    
-    # Scenario 1: No POI in reality
-    if not check_poi_existence(poi_point, poi_name):
-        return 1, "Mark for deletion"
-    
-    # Scenario 2: Incorrect POI location
-    # Check if POI is on correct side by analyzing nearby links
-    nearby_links = streets_nav[streets_nav.geometry.distance(poi_point) < 10 / 111000]  # ~10m
-    correct_link = None
-    for _, nearby in nearby_links.iterrows():
-        if nearby['link_id'] != link_id and nearby.geometry.distance(poi_point) < 5 / 111000:
-            correct_link = nearby
-            break
-    if correct_link is not None:
-        return 2, f"Update LINK_ID to {correct_link['link_id']}"
-    
-    # Scenario 3: Incorrect MULTIDIGIT attribution
-    naming1 = streets_naming[streets_naming['link_id'] == link1['link_id']]
-    naming2 = streets_naming[streets_naming['link_id'] == link2['link_id']]
-    if naming1.empty or naming2.empty:
-        logging.warning(f"Missing naming data for link1 {link1['link_id']} or link2 {link2['link_id']}")
-        return 3, "Set MULTIDIGIT = 'N' for both links"  # Fallback if no naming data
-    same_name = naming1.iloc[0]['ST_NAME'] == naming2.iloc[0]['ST_NAME']
-    no_vegetation = not check_vegetation(link_id, poi_point)
-    distance_ok = link1.geometry.distance(link2.geometry) < 30 / 111000  # ~30m threshold
-    if not (same_name and no_vegetation and distance_ok):
-        return 3, "Set MULTIDIGIT = 'N' for both links"
-    
-    # Scenario 4: Legitimate Exception
-    return 4, "Mark as Legitimate Exception"
+def find_multidigit_pairs(streets_nav, streets_naming):
+    """Identify pairs of MULTIDIGIT links with same ST_NAME."""
+    multidigit_links = streets_nav
+    pairs = []
+    max_links = 1000 #Temporary limit for testing
+    for idx1, link1 in multidigit_links.head(max_links).iterrows():
+        link_id1 = link1["link_id"]
+        geom1 = link1.geometry
+        #Find matching street name
+        naming1 = streets_naming[streets_naming['link_id']] == link_id1
+        if naming1.empty:
+            continue
+        st_name1 = naming1.iloc[0]['ST_NAME']
+        
+        #Finding a potential pair
+        for idx2,link2 in multidigit_links.iloc[idx1+1].head(max_links).iterrows():
+            naming2 = streets_naming[streets_naming['link_id'] == link2['link_id']]
+            if naming2.empty:
+                continue
+            st_name2 = naming2.iloc[0]['ST_NAME']
+            
+            #Check if same street and close proximity
+            if st_name1 == st_name2 and geom1.distance(link2.geometry) < 50 / 111000: #Around 50m
+                pairs.append((link_id1,link2['link_id'],geom1, link2.geometry))
+    return pairs
 
+def check_inside_multidigit(poi_point, link1_geom, link2_geom):
+    """Check if POI lies between two MULTIDIGIT links (inside)."""
+    if not (poi_point and link1_geom.is_valid and link2_geom.is_valid):
+        return False
+    try:
+        # Combine coordinates of both links to form a polygon
+        coords = list(link1_geom.coords) + list(link2_geom.coords)[::-1]  # Reverse second link for closed polygon
+        polygon = Polygon(coords)
+        return polygon.contains(poi_point)
+    except:
+        return False
 
 def main():
     # Parse command-line arguments
@@ -151,6 +151,7 @@ def main():
     logging.info(f"Processed {len(poi_gdf)} POIs with geometries")
     
     # Save temporary output for debugging
+    
     poi_gdf.drop(columns=['geometry']).to_csv('temp_pois.csv', index=False)
     print("Saved temporary output to temp_pois.csv")
 
