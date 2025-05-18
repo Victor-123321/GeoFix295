@@ -88,6 +88,44 @@ def compute_poi_geometry(poi_df, streets_nav):
     poi_gdf['geometry'] = geometries
     return gpd.GeoDataFrame(poi_gdf, crs="EPSG:4326")
 
+def classify_scenario(poi, poi_point, link1, link2, streets_nav, streets_naming):
+    """Classify POI295 violation into one of four scenarios."""
+    poi_id = poi['POI_ID']
+    poi_name = poi['POI_NAME']
+    link_id = poi['LINK_ID']
+    poi_st_sd = poi['POI_ST_SD']
+    
+    # Scenario 1: No POI in reality
+    if not check_poi_existence(poi_point, poi_name):
+        return 1, "Mark for deletion"
+    
+    # Scenario 2: Incorrect POI location
+    # Check if POI is on correct side by analyzing nearby links
+    nearby_links = streets_nav[streets_nav.geometry.distance(poi_point) < 10 / 111000]  # ~10m
+    correct_link = None
+    for _, nearby in nearby_links.iterrows():
+        if nearby['link_id'] != link_id and nearby.geometry.distance(poi_point) < 5 / 111000:
+            correct_link = nearby
+            break
+    if correct_link is not None:
+        return 2, f"Update LINK_ID to {correct_link['link_id']}"
+    
+    # Scenario 3: Incorrect MULTIDIGIT attribution
+    naming1 = streets_naming[streets_naming['link_id'] == link1['link_id']]
+    naming2 = streets_naming[streets_naming['link_id'] == link2['link_id']]
+    if naming1.empty or naming2.empty:
+        logging.warning(f"Missing naming data for link1 {link1['link_id']} or link2 {link2['link_id']}")
+        return 3, "Set MULTIDIGIT = 'N' for both links"  # Fallback if no naming data
+    same_name = naming1.iloc[0]['ST_NAME'] == naming2.iloc[0]['ST_NAME']
+    no_vegetation = not check_vegetation(link_id, poi_point)
+    distance_ok = link1.geometry.distance(link2.geometry) < 30 / 111000  # ~30m threshold
+    if not (same_name and no_vegetation and distance_ok):
+        return 3, "Set MULTIDIGIT = 'N' for both links"
+    
+    # Scenario 4: Legitimate Exception
+    return 4, "Mark as Legitimate Exception"
+
+
 def main():
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='Process POI295 validations')
